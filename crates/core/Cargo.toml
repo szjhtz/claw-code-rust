@@ -22,3 +22,15 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+claw-provider = { workspace = true }
+claw-tools = { workspace = true }
+claw-permissions = { workspace = true }
+claw-compact = { workspace = true }

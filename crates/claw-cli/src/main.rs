@@ -268,6 +268,7 @@ fn handle_event_text(event: QueryEvent) {
         QueryEvent::Usage {
             input_tokens,
             output_tokens,
+            ..
         } => {
             eprintln!("  [tokens: {} in / {} out]", input_tokens, output_tokens);
         }
@@ -300,8 +301,16 @@ fn handle_event_stream_json(event: QueryEvent) {
         QueryEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         } => {
-            serde_json::json!({ "type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens })
+            serde_json::json!({
+                "type": "usage",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+            })
         }
     };
     println!("{}", obj);

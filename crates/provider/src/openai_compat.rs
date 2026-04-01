@@ -6,9 +6,9 @@ use async_openai::{
         ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionTools,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, FinishReason, FunctionCall,
-        FunctionObject,
+        ChatCompletionStreamOptions, ChatCompletionStreamResponseDelta, ChatCompletionTool,
+        ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        FinishReason, FunctionCall, FunctionObject,
     },
     Client,
 };
@@ -129,6 +129,7 @@ impl ModelProvider for OpenAICompatProvider {
             let mut tool_blocks_started: std::collections::HashSet<u32> =
                 std::collections::HashSet::new();
             let mut finish_reason: Option<StopReason> = None;
+            let mut stream_usage: Option<Usage> = None;
 
             while let Some(chunk) = sdk_stream.next().await {
                 let chunk = match chunk {
@@ -141,6 +142,14 @@ impl ModelProvider for OpenAICompatProvider {
 
                 if response_id.is_empty() {
                     response_id = chunk.id.clone();
+                }
+
+                if let Some(u) = chunk.usage {
+                    stream_usage = Some(Usage {
+                        input_tokens: u.prompt_tokens as usize,
+                        output_tokens: u.completion_tokens as usize,
+                        ..Default::default()
+                    });
                 }
 
                 for choice in chunk.choices {
@@ -248,7 +257,7 @@ impl ModelProvider for OpenAICompatProvider {
                 id: response_id,
                 content,
                 stop_reason: finish_reason,
-                usage: Usage::default(),
+                usage: stream_usage.unwrap_or_default(),
             };
             let _ = tx.send(Ok(StreamEvent::MessageDone { response })).await;
         });
@@ -364,7 +373,11 @@ fn build_request(request: &ModelRequest) -> anyhow::Result<CreateChatCompletionR
     builder
         .model(request.model.clone())
         .messages(messages)
-        .max_tokens(request.max_tokens as u32);
+        .max_tokens(request.max_tokens as u32)
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
 
     if let Some(temp) = request.temperature {
         builder.temperature(temp as f32);

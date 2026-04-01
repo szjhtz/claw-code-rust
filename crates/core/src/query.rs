@@ -27,11 +27,123 @@ pub enum QueryEvent {
     Usage {
         input_tokens: usize,
         output_tokens: usize,
+        cache_creation_input_tokens: Option<usize>,
+        cache_read_input_tokens: Option<usize>,
     },
 }
 
 /// Callback for streaming query events to the UI layer.
 pub type EventCallback = Arc<dyn Fn(QueryEvent) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Error classification (capability 3.2)
+// ---------------------------------------------------------------------------
+
+enum ErrorClass {
+    ContextTooLong,
+    RateLimit,
+    ServerError,
+    Unretryable,
+}
+
+fn classify_error(e: &anyhow::Error) -> ErrorClass {
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("context_too_long") {
+        ErrorClass::ContextTooLong
+    } else if msg.contains("429") || msg.contains("rate limit") {
+        ErrorClass::RateLimit
+    } else if msg.starts_with('5')
+        || msg.contains("500")
+        || msg.contains("502")
+        || msg.contains("503")
+        || msg.contains("internal server error")
+    {
+        ErrorClass::ServerError
+    } else {
+        ErrorClass::Unretryable
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session compaction (capabilities 1.3 / 1.7)
+// ---------------------------------------------------------------------------
+
+/// Remove older messages to bring the conversation within budget.
+/// Returns how many messages were removed.
+fn compact_session(session: &mut SessionState) -> usize {
+    let msg_count = session.messages.len();
+    if msg_count <= 2 {
+        return 0;
+    }
+
+    let input_budget = session.config.token_budget.input_budget();
+    let last_tokens = session.last_input_tokens;
+
+    if last_tokens == 0 {
+        // No token data yet — drop the oldest half
+        let remove = msg_count / 2;
+        session.messages.drain(..remove);
+        return remove;
+    }
+
+    let avg_tokens_per_msg = last_tokens / msg_count;
+    if avg_tokens_per_msg == 0 {
+        let remove = msg_count / 2;
+        session.messages.drain(..remove);
+        return remove;
+    }
+
+    // Aim for 70 % of input budget so the next request has headroom
+    let target_tokens = (input_budget as f64 * 0.7) as usize;
+    let keep_count = (target_tokens / avg_tokens_per_msg).max(2).min(msg_count);
+    let remove_count = msg_count - keep_count;
+
+    if remove_count > 0 {
+        session.messages.drain(..remove_count);
+    }
+    remove_count
+}
+
+// ---------------------------------------------------------------------------
+// Micro compact (capability 1.4)
+// ---------------------------------------------------------------------------
+
+const MICRO_COMPACT_THRESHOLD: usize = 10_000;
+
+fn micro_compact(content: String) -> String {
+    if content.len() > MICRO_COMPACT_THRESHOLD {
+        let mut truncated = content[..MICRO_COMPACT_THRESHOLD].to_string();
+        truncated.push_str("\n...[truncated]");
+        truncated
+    } else {
+        content
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory prefetch (capability 1.9)
+// ---------------------------------------------------------------------------
+
+fn load_claude_md(cwd: &std::path::Path) -> Option<String> {
+    let path = cwd.join("CLAUDE.md");
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn build_system_prompt(base: &str, memory: &Option<String>) -> String {
+    match (base.is_empty(), memory) {
+        (true, Some(mem)) => mem.clone(),
+        (false, Some(mem)) => format!("{}\n\n{}", base, mem),
+        _ => base.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main query loop
+// ---------------------------------------------------------------------------
+
+const MAX_RETRIES: usize = 3;
 
 /// The recursive agent loop — the beating heart of the runtime.
 ///
@@ -62,7 +174,21 @@ pub async fn query(
         }
     };
 
+    // 1.9: Memory prefetch — load CLAUDE.md once before the loop
+    let memory_content = load_claude_md(&session.cwd);
+
+    let mut retry_count: usize = 0;
+    let mut context_compacted = false;
+
     loop {
+        // 1.3 + 1.7: Check token budget and compact before building the request
+        if session.last_input_tokens > 0
+            && session.config.token_budget.should_compact(session.last_input_tokens)
+        {
+            info!("token budget threshold exceeded — compacting session");
+            compact_session(session);
+        }
+
         if session.turn_count >= session.config.max_turns {
             return Err(AgentError::MaxTurnsExceeded(session.config.max_turns));
         }
@@ -71,12 +197,13 @@ pub async fn query(
         info!(turn = session.turn_count, "starting turn");
 
         // Build model request
+        let system = build_system_prompt(&session.config.system_prompt, &memory_content);
         let request = ModelRequest {
             model: session.config.model.clone(),
-            system: if session.config.system_prompt.is_empty() {
+            system: if system.is_empty() {
                 None
             } else {
-                Some(session.config.system_prompt.clone())
+                Some(system)
             },
             messages: session.to_request_messages(),
             max_tokens: session.config.token_budget.max_output_tokens,
@@ -84,11 +211,43 @@ pub async fn query(
             temperature: None,
         };
 
-        // Stream model response
-        let mut stream = provider
-            .stream(request)
-            .await
-            .map_err(AgentError::Provider)?;
+        // 3.2: Stream with error classification
+        let stream_result = provider.stream(request).await;
+
+        let mut stream = match stream_result {
+            Ok(s) => {
+                retry_count = 0;
+                context_compacted = false;
+                s
+            }
+            Err(e) => {
+                match classify_error(&e) {
+                    ErrorClass::ContextTooLong => {
+                        // 1.5: Compact history and retry once
+                        if context_compacted {
+                            return Err(AgentError::ContextTooLong);
+                        }
+                        warn!("context_too_long — compacting and retrying");
+                        compact_session(session);
+                        context_compacted = true;
+                        session.turn_count -= 1;
+                        continue;
+                    }
+                    ErrorClass::RateLimit | ErrorClass::ServerError => {
+                        if retry_count < MAX_RETRIES {
+                            retry_count += 1;
+                            warn!(attempt = retry_count, "transient error — retrying");
+                            session.turn_count -= 1;
+                            continue;
+                        }
+                        return Err(AgentError::Provider(e));
+                    }
+                    ErrorClass::Unretryable => {
+                        return Err(AgentError::Provider(e));
+                    }
+                }
+            }
+        };
 
         let mut assistant_text = String::new();
         let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // (id, name, json_accum)
@@ -117,11 +276,21 @@ pub async fn query(
                 }
                 Ok(StreamEvent::MessageDone { response }) => {
                     stop_reason = response.stop_reason.clone();
+
+                    // 1.11: Accumulate all usage counters
                     session.total_input_tokens += response.usage.input_tokens;
                     session.total_output_tokens += response.usage.output_tokens;
+                    session.total_cache_creation_tokens +=
+                        response.usage.cache_creation_input_tokens.unwrap_or(0);
+                    session.total_cache_read_tokens +=
+                        response.usage.cache_read_input_tokens.unwrap_or(0);
+                    session.last_input_tokens = response.usage.input_tokens;
+
                     emit(QueryEvent::Usage {
                         input_tokens: response.usage.input_tokens,
                         output_tokens: response.usage.output_tokens,
+                        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                        cache_read_input_tokens: response.usage.cache_read_input_tokens,
                     });
                 }
                 Ok(_) => {}
@@ -160,8 +329,17 @@ pub async fn query(
             content: assistant_content,
         });
 
-        // If no tool calls, we're done
+        // If no tool calls, check stop reason
         if tool_calls.is_empty() {
+            // 1.6: MaxOutputTokens auto-continue
+            if stop_reason == Some(StopReason::MaxTokens) {
+                debug!("max_tokens reached — injecting continuation prompt");
+                session.push_message(Message::user(
+                    "Please continue from where you left off.",
+                ));
+                continue;
+            }
+
             if let Some(sr) = stop_reason {
                 emit(QueryEvent::TurnComplete { stop_reason: sr });
             }
@@ -181,17 +359,19 @@ pub async fn query(
         let results = orchestrator.execute_batch(&tool_calls, &tool_ctx).await;
 
         // Build tool result message (user role, per Anthropic API convention)
+        // 1.4: Apply micro-compact to large tool results
         let result_content: Vec<ContentBlock> = results
             .into_iter()
             .map(|r| {
+                let compacted_content = micro_compact(r.output.content.clone());
                 emit(QueryEvent::ToolResult {
                     tool_use_id: r.tool_use_id.clone(),
-                    content: r.output.content.clone(),
+                    content: compacted_content.clone(),
                     is_error: r.output.is_error,
                 });
                 ContentBlock::ToolResult {
                     tool_use_id: r.tool_use_id,
-                    content: r.output.content,
+                    content: compacted_content,
                     is_error: r.output.is_error,
                 }
             })
@@ -201,9 +381,6 @@ pub async fn query(
             role: Role::User,
             content: result_content,
         });
-
-        // Tool results appended — loop back to get the model's follow-up response.
-        // Never exit here: the model must see the tool results before we can stop.
     }
 }
 

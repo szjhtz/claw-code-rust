@@ -39,6 +39,11 @@ pub struct SessionState {
     pub turn_count: usize,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    pub total_cache_creation_tokens: usize,
+    pub total_cache_read_tokens: usize,
+    /// Input tokens reported by the model for the most recent turn.
+    /// Used by `TokenBudget::should_compact()` to decide when to compact.
+    pub last_input_tokens: usize,
 }
 
 impl SessionState {
@@ -51,6 +56,9 @@ impl SessionState {
             turn_count: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_creation_tokens: 0,
+            total_cache_read_tokens: 0,
+            last_input_tokens: 0,
         }
     }
 
